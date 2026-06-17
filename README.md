@@ -6,12 +6,18 @@ Press Ctrl+Alt+Shift+O, drag a box over text on any monitor, and the recognized 
 
 ## What It Uses
 
-- PaddleOCR with PP-OCRv6_medium_det
-- PaddleOCR with PP-OCRv6_medium_rec
+- PaddleOCR with [PP-OCRv6_medium_det_safetensors](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det_safetensors)
+- PaddleOCR with [PP-OCRv6_medium_rec_safetensors](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec_safetensors)
 - The Transformers engine and safetensors model weights
 - A per-monitor capture overlay for multi-display Windows setups
 
 The detector model finds text boxes; the recognition model turns those boxes into text. Both are needed for clipboard OCR.
+
+## Model Benchmarks
+
+The PP-OCRv6 model card reports strong text detection and recognition scores for the medium model.
+
+![PP-OCRv6 benchmark chart](assets/pp-ocrv6-benchmarks.png)
 
 ## Install
 
