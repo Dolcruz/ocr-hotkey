@@ -22,7 +22,9 @@ function Resolve-Python {
 
         try {
             & $candidate.Command @($candidate.Args + @("-c", "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 12) else 1)"))
-            return $candidate
+            if ($LASTEXITCODE -eq 0) {
+                return $candidate
+            }
         } catch {
             continue
         }
@@ -37,14 +39,18 @@ $python = Resolve-Python
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host "Creating virtual environment..."
     & $python.Command @($python.Args + @("-m", "venv", $venvDir))
+    if ($LASTEXITCODE -ne 0) { throw "Failed to create the virtual environment." }
 }
 
 Write-Host "Installing Python packages. This can take several minutes..."
 & $venvPython -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip." }
 & $venvPython -m pip install -r $requirements
+if ($LASTEXITCODE -ne 0) { throw "Failed to install dependencies. Startup was not installed." }
 
 Write-Host "Installing startup shortcut..."
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installStartup
+if ($LASTEXITCODE -ne 0) { throw "Failed to install the startup shortcut." }
 
 Write-Host "Starting OCR hotkey..."
 $pythonw = Join-Path $venvDir "Scripts\pythonw.exe"
