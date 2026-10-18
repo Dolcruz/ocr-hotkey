@@ -6,6 +6,7 @@ from ctypes import wintypes
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import traceback
@@ -19,6 +20,14 @@ LOG_PATH = APP_DIR / "ocr-hotkey.log"
 LAST_CAPTURE_PATH = APP_DIR / "last_capture.png"
 DEFAULT_HOTKEY = "<ctrl>+<alt>+<shift>+o"
 MIN_SELECTION_PX = 6
+HOTKEY_ID = 0xA11
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
 
 
 def set_window_bounds(window: Any, left: int, top: int, width: int, height: int) -> None:
@@ -98,6 +107,8 @@ def setup_logging() -> None:
 def ensure_single_instance() -> int | None:
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
         handle = kernel32.CreateMutexW(None, False, "Local\\FalkOcrHotkey")
         if handle and ctypes.get_last_error() == 183:
             logging.info("Another OCR hotkey instance is already running; exiting.")
@@ -106,6 +117,125 @@ def ensure_single_instance() -> int | None:
     except Exception:
         logging.exception("Could not create single-instance mutex")
         return None
+
+
+def parse_windows_hotkey(hotkey: str) -> tuple[int, int]:
+    modifier_map = {
+        "alt": MOD_ALT,
+        "ctrl": MOD_CONTROL,
+        "control": MOD_CONTROL,
+        "shift": MOD_SHIFT,
+        "win": MOD_WIN,
+        "windows": MOD_WIN,
+    }
+    key_map = {
+        "backspace": 0x08,
+        "tab": 0x09,
+        "enter": 0x0D,
+        "escape": 0x1B,
+        "esc": 0x1B,
+        "space": 0x20,
+        "page_up": 0x21,
+        "page_down": 0x22,
+        "end": 0x23,
+        "home": 0x24,
+        "left": 0x25,
+        "up": 0x26,
+        "right": 0x27,
+        "down": 0x28,
+        "insert": 0x2D,
+        "delete": 0x2E,
+    }
+
+    modifiers = MOD_NOREPEAT
+    key_name: str | None = None
+    for part in hotkey.lower().split("+"):
+        name = part.strip().strip("<>")
+        if name in modifier_map:
+            modifiers |= modifier_map[name]
+        elif key_name is None:
+            key_name = name
+        else:
+            raise ValueError(f"Hotkey has more than one regular key: {hotkey}")
+
+    if key_name is None:
+        raise ValueError(f"Hotkey has no regular key: {hotkey}")
+    if len(key_name) == 1 and key_name.isascii() and key_name.isalnum():
+        virtual_key = ord(key_name.upper())
+    elif key_name.startswith("f") and key_name[1:].isdigit() and 1 <= int(key_name[1:]) <= 24:
+        virtual_key = 0x70 + int(key_name[1:]) - 1
+    elif key_name in key_map:
+        virtual_key = key_map[key_name]
+    else:
+        raise ValueError(f"Unsupported hotkey key: {key_name}")
+    return modifiers, virtual_key
+
+
+class NativeHotkeyListener:
+    def __init__(self, hotkey: str, callback: Any) -> None:
+        self.hotkey = hotkey
+        self.callback = callback
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+
+    def start(self) -> None:
+        self._ready.clear()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name="ocr-hotkey-listener", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=5):
+            raise RuntimeError("Timed out while registering the global OCR hotkey")
+        if self._error is not None:
+            raise self._error
+
+    def stop(self) -> None:
+        if self._thread_id:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        try:
+            modifiers, virtual_key = parse_windows_hotkey(self.hotkey)
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+            if not user32.RegisterHotKey(None, HOTKEY_ID, modifiers, virtual_key):
+                error_code = ctypes.get_last_error()
+                raise ctypes.WinError(error_code)
+            logging.info("Registered native Windows hotkey: %s", self.hotkey)
+            self._ready.set()
+
+            message = wintypes.MSG()
+            while True:
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                if message.message == WM_HOTKEY and int(message.wParam) == HOTKEY_ID:
+                    try:
+                        self.callback()
+                    except Exception:
+                        logging.exception("OCR hotkey callback failed")
+        except BaseException as error:
+            self._error = error
+            logging.exception("Native OCR hotkey listener failed")
+            self._ready.set()
+        finally:
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+            self._thread_id = 0
 
 
 class OcrEngine:
@@ -352,23 +482,49 @@ class OcrHotkeyApp:
         self.preload = preload
         self.engine = OcrEngine()
         self.busy = False
+        self._hotkey_events: queue.SimpleQueue[None] = queue.SimpleQueue()
+        self._listener: Any | None = None
         self.root = tk.Tk()
         self.root.withdraw()
 
     def run(self) -> int:
-        from pynput import keyboard
-
         logging.info("Starting OCR hotkey listener: %s", self.hotkey)
         if self.preload:
             threading.Thread(target=self._preload_model, daemon=True).start()
 
-        listener = keyboard.GlobalHotKeys({self.hotkey: self._hotkey_pressed})
-        listener.start()
+        self._start_listener()
+        self.root.after(50, self._poll_hotkey_events)
+        self.root.after(5_000, self._watch_listener)
         try:
             self.root.mainloop()
         finally:
-            listener.stop()
+            if self._listener is not None:
+                self._listener.stop()
         return 0
+
+    def _start_listener(self) -> None:
+        try:
+            listener = NativeHotkeyListener(self.hotkey, self._hotkey_pressed)
+            listener.start()
+            self._listener = listener
+        except Exception:
+            self._listener = None
+            logging.exception("Could not start OCR hotkey listener")
+
+    def _poll_hotkey_events(self) -> None:
+        try:
+            while True:
+                self._hotkey_events.get_nowait()
+                self._start_selection()
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_hotkey_events)
+
+    def _watch_listener(self) -> None:
+        if self._listener is None or not self._listener.is_alive():
+            logging.warning("OCR hotkey listener stopped; restarting it")
+            self._start_listener()
+        self.root.after(5_000, self._watch_listener)
 
     def _preload_model(self) -> None:
         try:
@@ -377,13 +533,15 @@ class OcrHotkeyApp:
             logging.exception("OCR model preload failed")
 
     def _hotkey_pressed(self) -> None:
-        self.root.after(0, self._start_selection)
+        logging.info("OCR hotkey pressed")
+        self._hotkey_events.put(None)
 
     def _start_selection(self) -> None:
         if self.busy:
             self._message("OCR is still running")
             winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             return
+        logging.info("Opening OCR selection overlay")
         SelectionOverlay(self.root, self._process_selection)
 
     def _process_selection(self, regions: list[tuple[int, int, int, int]]) -> None:
@@ -459,7 +617,7 @@ def ocr_image_once(image_path: Path) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Global screen-region OCR hotkey")
-    parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="pynput hotkey syntax")
+    parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="Windows hotkey, e.g. <ctrl>+<alt>+<shift>+o")
     parser.add_argument("--no-preload", action="store_true", help="load OCR model on first use")
     parser.add_argument("--ocr-image", type=Path, help="OCR one image and print the result")
     return parser.parse_args()
